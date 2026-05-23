@@ -85,11 +85,16 @@ export async function generateEmbedding(
       console.log('[ArcFace] Inputs attendus:', session.inputNames);
       console.log('[ArcFace] Outputs attendus:', session.outputNames);
 
-      const results = await session.run({ input: inputTensor });
+      //const results = await session.run({ input: inputTensor });
+      const inputName = session.inputNames[0]; // = 'input.1'
+      const results = await session.run({ [inputName]: inputTensor });
 
-      const embedData = (
-        results['output']?.data ?? results[Object.keys(results)[0]]?.data
-      ) as Float32Array;
+      //const embedData = (
+      //  results['output']?.data ?? results[Object.keys(results)[0]]?.data
+      //) as Float32Array;
+
+      const outputName = session.outputNames[0]; // = '516'
+      const embedData = results[outputName]?.data as Float32Array;
 
       if (!embedData || embedData.length !== 512) {
         throw new Error('Forme embedding invalide');
