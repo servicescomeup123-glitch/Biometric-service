@@ -9,15 +9,14 @@ const MODEL_URLS = {
   arcface: `${R2_MODELS_BASE}/w600k_mbf.onnx`,
 };
 
-let arcfaceSession: any = null;
-let ortModule: any      = null;
+let arcfaceSession: any           = null;
+let ortModule: any                = null;
 let onnxAvailable: boolean | null = null;
 
 // ─── Chargement ONNX ─────────────────────────────────────────────────────────
 
 async function getOrtModule(): Promise<any> {
   if (ortModule) return ortModule;
-  // Sur Railway, require() fonctionne normalement (pas de bundler webpack)
   ortModule = require('onnxruntime-node');
   return ortModule;
 }
@@ -66,58 +65,52 @@ export async function generateEmbedding(
     try {
       const ort = await getOrtModule();
 
+      // Préprocessing InsightFace officiel :
+      // 1. Resize 112×112 (taille native ArcFace)
+      // 2. PAS de normalize() sharp — ça casserait la distribution d'entraînement
+      // 3. Normalisation pixel : (pixel / 127.5) - 1.0  → valeurs dans [-1, +1]
+      // Note : sharpen léger OK car il ne change pas la distribution globale
       const resized = await sharp(portraitBuffer)
         .resize(112, 112, { fit: 'fill', kernel: 'lanczos3' })
         .removeAlpha()
-        .normalize()          // ← étale l'histogramme (compense photo sombre/claire)
-        .sharpen({ sigma: 0.5 }) // ← compense légère compression JPEG
         .raw()
         .toBuffer();
 
+      // Format NCHW : [1, 3, 112, 112]
+      // Canal R → index i, G → 112*112+i, B → 2*112*112+i
       const tensor = new Float32Array(3 * 112 * 112);
       for (let i = 0; i < 112 * 112; i++) {
-        tensor[i]                 = (resized[i * 3]     / 127.5) - 1.0;
-        tensor[112 * 112 + i]     = (resized[i * 3 + 1] / 127.5) - 1.0;
-        tensor[2 * 112 * 112 + i] = (resized[i * 3 + 2] / 127.5) - 1.0;
+        tensor[i]                 = (resized[i * 3]     / 127.5) - 1.0; // R
+        tensor[112 * 112 + i]     = (resized[i * 3 + 1] / 127.5) - 1.0; // G
+        tensor[2 * 112 * 112 + i] = (resized[i * 3 + 2] / 127.5) - 1.0; // B
       }
 
+      const inputName   = session.inputNames[0];  // 'input.1'
+      const outputName  = session.outputNames[0]; // '516'
       const inputTensor = new ort.Tensor('float32', tensor, [1, 3, 112, 112]);
+      const results     = await session.run({ [inputName]: inputTensor });
 
-      // Ajoute ces deux lignes
-      console.log('[ArcFace] Inputs attendus:', session.inputNames);
-      console.log('[ArcFace] Outputs attendus:', session.outputNames);
-
-      //const results = await session.run({ input: inputTensor });
-      const inputName = session.inputNames[0]; // = 'input.1'
-      const results = await session.run({ [inputName]: inputTensor });
-
-      //const embedData = (
-      //  results['output']?.data ?? results[Object.keys(results)[0]]?.data
-      //) as Float32Array;
-
-      const outputName = session.outputNames[0]; // = '516'
       const embedData = results[outputName]?.data as Float32Array;
-
       if (!embedData || embedData.length !== 512) {
-        throw new Error('Forme embedding invalide');
+        throw new Error(`Embedding invalide: length=${embedData?.length ?? 'null'}`);
       }
 
-      console.log('[ArcFace] Embedding ONNX 512-dim généré avec succès');
+      console.log('[ArcFace] ✓ Embedding 512-dim généré');
       return { embedding: l2Normalize(embedData), confidence: 0.95, method: 'onnx' };
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn('[ArcFace] Erreur ONNX runtime:', msg, '— bascule sur Claude Vision');
+      console.warn('[ArcFace] Erreur ONNX:', msg, '— bascule Claude Vision');
       onnxAvailable = false;
     }
   }
 
   // ── Fallback Claude Vision ─────────────────────────────────────────────────
   console.log('[ArcFace] Fallback Claude Vision pour embedding');
-  return await generateClaudeEmbedding(portraitBuffer);
+  return generateClaudeEmbedding(portraitBuffer);
 }
 
-// ─── Pseudo-embedding Claude Vision ──────────────────────────────────────────
+// ─── Pseudo-embedding Claude Vision (fallback) ────────────────────────────────
 
 async function generateClaudeEmbedding(
   portraitBuffer: Buffer,
@@ -153,18 +146,18 @@ Descripteurs à encoder (dans cet ordre) :
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY!,
+        'Content-Type':    'application/json',
+        'x-api-key':       process.env.ANTHROPIC_API_KEY!,
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
+        model:      'claude-sonnet-4-5',
         max_tokens: 256,
         messages: [{
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
-            { type: 'text', text: prompt },
+            { type: 'text',  text: prompt },
           ],
         }],
       }),
@@ -201,7 +194,7 @@ Descripteurs à encoder (dans cet ordre) :
   }
 }
 
-// ─── Utilitaires ──────────────────────────────────────────────────────────────
+// ─── L2 normalisation ────────────────────────────────────────────────────────
 
 export function l2Normalize(vec: Float32Array): Float32Array {
   let norm = 0;
