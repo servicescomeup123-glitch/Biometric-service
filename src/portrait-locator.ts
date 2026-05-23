@@ -147,25 +147,25 @@ async function detectWithONNX(
       const fH = Math.floor(INPUT_SIZE / stride);
       const fW = Math.floor(INPUT_SIZE / stride);
 
-      // Générer les centres d'anchors (ordre row-major, NUM_ANCHORS par cellule)
+      // Centres d'anchors selon InsightFace officiel :
+      // les NUM_ANCHORS anchors d'une même cellule partagent le même centre
       for (let i = 0; i < N; i++) {
         const score = scores[i];
         if (score < 0.4 || score <= topScore) continue;
 
-        const anchorIdx = i % NUM_ANCHORS;
-        const cellIdx   = Math.floor(i / NUM_ANCHORS);
-        const cx_cell   = cellIdx % fW;
-        const cy_cell   = Math.floor(cellIdx / fW);
+        const cellIdx = Math.floor(i / NUM_ANCHORS);
+        const cx_cell = cellIdx % fW;
+        const cy_cell = Math.floor(cellIdx / fW);
 
-        // Centre de l'anchor en pixels (espace input 640×640)
-        const ax = (cx_cell * NUM_ANCHORS + anchorIdx + 0.5) * stride;
+        // Centre identique pour tous les anchors de cette cellule
+        const ax = (cx_cell + 0.5) * stride;
         const ay = (cy_cell + 0.5) * stride;
 
-        // SCRFD : bbox = distances depuis le centre (l, t, r, b) * stride
-        const x1 = (ax - bboxes[i * 4 + 0] * stride) / INPUT_SIZE * W;
-        const y1 = (ay - bboxes[i * 4 + 1] * stride) / INPUT_SIZE * H;
-        const x2 = (ax + bboxes[i * 4 + 2] * stride) / INPUT_SIZE * W;
-        const y2 = (ay + bboxes[i * 4 + 3] * stride) / INPUT_SIZE * H;
+        // SCRFD : les deltas bbox sont déjà en pixels (pas besoin de * stride)
+        const x1 = (ax - bboxes[i * 4 + 0]) / INPUT_SIZE * W;
+        const y1 = (ay - bboxes[i * 4 + 1]) / INPUT_SIZE * H;
+        const x2 = (ax + bboxes[i * 4 + 2]) / INPUT_SIZE * W;
+        const y2 = (ay + bboxes[i * 4 + 3]) / INPUT_SIZE * H;
 
         topScore = score;
         topBox   = { x1, y1, x2, y2 };
