@@ -80,7 +80,12 @@ export async function generateEmbedding(
       }
 
       const inputTensor = new ort.Tensor('float32', tensor, [1, 3, 112, 112]);
-      const results     = await session.run({ input: inputTensor });
+
+      // Ajoute ces deux lignes
+      console.log('[ArcFace] Inputs attendus:', session.inputNames);
+      console.log('[ArcFace] Outputs attendus:', session.outputNames);
+
+      const results = await session.run({ input: inputTensor });
 
       const embedData = (
         results['output']?.data ?? results[Object.keys(results)[0]]?.data
