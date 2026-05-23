@@ -4,6 +4,8 @@ import { runBiometricPipeline } from './pipeline';
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+let modelsReady = false;
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 app.use(express.json({ limit: '20mb' }));
@@ -17,21 +19,29 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+function readyMiddleware(_req: Request, res: Response, next: NextFunction) {
+  if (!modelsReady) {
+    return res.status(503).json({ error: 'Service en cours d\'initialisation, réessayez dans quelques secondes.' });
+  }
+  next();
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: Math.floor(process.uptime()) });
+  res.json({
+    status:      modelsReady ? 'ok' : 'starting',
+    modelsReady,
+    uptime:      Math.floor(process.uptime()),
+  });
 });
 
-app.post('/biometric/match', authMiddleware, async (req: Request, res: Response) => {
+app.post('/biometric/match', authMiddleware, readyMiddleware, async (req: Request, res: Response) => {
   const { documentImageBase64, selfieBase64 } = req.body;
 
   if (!documentImageBase64 || !selfieBase64) {
-    return res.status(400).json({
-      error: 'documentImageBase64 et selfieBase64 sont requis',
-    });
+    return res.status(400).json({ error: 'documentImageBase64 et selfieBase64 sont requis' });
   }
-
   if (typeof documentImageBase64 !== 'string' || typeof selfieBase64 !== 'string') {
     return res.status(400).json({ error: 'Les images doivent être des strings base64' });
   }
@@ -52,7 +62,6 @@ app.listen(PORT, async () => {
   console.log(`[Server] SERVICE_SECRET_KEY: ${process.env.SERVICE_SECRET_KEY ? '✓ configurée' : '⚠ non configurée (dev mode)'}`);
   console.log(`[Server] R2_MODELS_BASE_URL: ${process.env.R2_MODELS_BASE_URL ?? 'défaut pub-91a...'}`);
   console.log(`[Server] ANTHROPIC_API_KEY:  ${process.env.ANTHROPIC_API_KEY  ? '✓ configurée' : '✗ manquante'}`);
-
   console.log('[Server] Pré-chargement des modèles ONNX...');
 
   try {
@@ -64,46 +73,22 @@ app.listen(PORT, async () => {
       getDetector(),
     ]);
 
-    // ── ArcFace ──────────────────────────────────────────────────────────────
     if (arcfaceSession) {
-      console.log('[Server] ✓ ArcFace ONNX chargé');
-      console.log('[Server]   ArcFace inputs :', JSON.stringify(arcfaceSession.inputNames));
-      console.log('[Server]   ArcFace outputs:', JSON.stringify(arcfaceSession.outputNames));
+      console.log('[Server] ✓ ArcFace   — inputs:', JSON.stringify(arcfaceSession.inputNames), '| outputs:', JSON.stringify(arcfaceSession.outputNames));
     } else {
-      console.error('[Server] ✗ ArcFace ONNX ÉCHEC — fallback Claude Vision actif');
+      console.error('[Server] ✗ ArcFace ÉCHEC — fallback Claude Vision actif');
     }
 
-    // ── Détecteur portrait ───────────────────────────────────────────────────
     if (detectorSession) {
-      console.log('[Server] ✓ Détecteur portrait ONNX chargé');
-      console.log('[Server]   Detector inputs :', JSON.stringify(detectorSession.inputNames));
-      console.log('[Server]   Detector outputs:', JSON.stringify(detectorSession.outputNames));
-
-      // Log les dims de chaque output pour diagnostiquer le parsing SCRFD
-      // On fait un run de test avec une image noire 640×640
-      try {
-        const ort         = require('onnxruntime-node');
-        const dummyTensor = new ort.Tensor('float32', new Float32Array(3 * 640 * 640), [1, 3, 640, 640]);
-        const inputName   = detectorSession.inputNames[0];
-        const dummyResult = await detectorSession.run({ [inputName]: dummyTensor });
-
-        console.log('[Server]   Detector output sizes (run test):');
-        for (const name of detectorSession.outputNames) {
-          const data = dummyResult[name]?.data as Float32Array | undefined;
-          const dims = dummyResult[name]?.dims as number[] | undefined;
-          console.log(`[Server]     "${name}" → length=${data?.length ?? 'N/A'} dims=${JSON.stringify(dims ?? [])}`);
-        }
-      } catch (testErr) {
-        console.warn('[Server]   Run test détecteur échoué:', testErr);
-      }
-
+      console.log('[Server] ✓ Détecteur — inputs:', JSON.stringify(detectorSession.inputNames), '| outputs:', JSON.stringify(detectorSession.outputNames));
     } else {
-      console.error('[Server] ✗ Détecteur portrait ONNX ÉCHEC — fallback heuristique actif');
+      console.error('[Server] ✗ Détecteur ÉCHEC — fallback heuristique actif');
     }
 
   } catch (err) {
     console.error('[Server] Erreur pré-chargement modèles:', err);
   }
 
-  console.log('[Server] Modèles prêts — service opérationnel.');
+  modelsReady = true;
+  console.log('[Server] ✓ Modèles prêts — service opérationnel.');
 });
