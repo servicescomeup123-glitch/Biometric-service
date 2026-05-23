@@ -19,6 +19,8 @@ export interface BiometricPipelineResult {
     docDetectionConfidence:      number;
     portraitDetectionMethod:     string;
     portraitDetectionConfidence: number;
+    selfieDetectionMethod:       string;
+    selfieDetectionConfidence:   number;
     embeddingMethod:             string;
     durationMs:                  number;
   };
@@ -26,14 +28,15 @@ export interface BiometricPipelineResult {
 
 // ─── Normalisation image ──────────────────────────────────────────────────────
 
-async function normalizeInput(base64: string): Promise<{ buffer: Buffer; width: number; height: number }> {
+async function normalizeInput(
+  base64: string,
+): Promise<{ buffer: Buffer; width: number; height: number }> {
   const data   = base64.replace(/^data:image\/\w+;base64,/, '');
   const buffer = Buffer.from(data, 'base64');
   const meta   = await sharp(buffer).metadata();
   const width  = meta.width  ?? 800;
   const height = meta.height ?? 600;
 
-  // Redimensionner si trop grande (économie mémoire)
   if (width > 1600 || height > 1600) {
     const resized = await sharp(buffer)
       .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
@@ -46,26 +49,28 @@ async function normalizeInput(base64: string): Promise<{ buffer: Buffer; width: 
   return { buffer, width, height };
 }
 
-// ─── Amélioration portrait ────────────────────────────────────────────────────
+// ─── Crop + resize vers 112×112 pour ArcFace ─────────────────────────────────
 
-async function enhancePortrait(
+async function cropAndResize(
   imageBuffer: Buffer,
   zone: { left: number; top: number; width: number; height: number },
 ): Promise<Buffer> {
   return sharp(imageBuffer)
-    .extract({ left: Math.round(zone.left), top: Math.round(zone.top), width: Math.round(zone.width), height: Math.round(zone.height) })
-    .resize(224, 224, { fit: 'fill', kernel: 'lanczos3' })
-    .normalize()
+    .extract({
+      left:   Math.max(0, Math.round(zone.left)),
+      top:    Math.max(0, Math.round(zone.top)),
+      width:  Math.max(1, Math.round(zone.width)),
+      height: Math.max(1, Math.round(zone.height)),
+    })
+    .resize(112, 112, { fit: 'fill', kernel: 'lanczos3' })
+    .removeAlpha()
     .jpeg({ quality: 95 })
     .toBuffer();
 }
 
-// ─── Détection document (contours Canny simplifié) ────────────────────────────
+// ─── Détection document ───────────────────────────────────────────────────────
 
 async function detectDocument(buffer: Buffer, w: number, h: number) {
-  // Sur Railway on a sharp — on fait une détection simple de confiance
-  // La détection de coins Canny nécessite opencv4nodejs (trop lourd)
-  // → on retourne le buffer tel quel avec confiance 0.9 (image uploadée manuellement = bonne qualité)
   return { warpedBuffer: buffer, confidence: 0.9, method: 'direct_upload' as const };
 }
 
@@ -80,19 +85,22 @@ export async function runBiometricPipeline(
   console.log('[Pipeline] Démarrage pipeline biométrique');
 
   try {
-    // Étape 1 — Normaliser images
+    // ── Étape 1 : Normaliser images ───────────────────────────────────────────
     const { buffer: docBuffer, width: docW, height: docH } =
       await normalizeInput(input.documentImageBase64);
     const { buffer: selfieBuffer, width: selfieW, height: selfieH } =
       await normalizeInput(input.selfieBase64);
 
-    // Étape 2 — Détecter document
+    console.log(`[Pipeline] Doc: ${docW}×${docH} | Selfie: ${selfieW}×${selfieH}`);
+
+    // ── Étape 2 : Détecter document ───────────────────────────────────────────
     const docDetection = await detectDocument(docBuffer, docW, docH);
     console.log(`[Pipeline] Doc: confiance=${docDetection.confidence.toFixed(2)} méthode=${docDetection.method}`);
 
-    // Étape 3 — Localiser portrait sur le document
+    // ── Étape 3 : Localiser portrait sur le document ──────────────────────────
     const portraitZone = await locatePortrait(docDetection.warpedBuffer, docW, docH);
-    console.log(`[Pipeline] Portrait: méthode=${portraitZone.method} confiance=${portraitZone.confidence.toFixed(2)}`);
+    console.log(`[Pipeline] Portrait doc: méthode=${portraitZone.method} confiance=${portraitZone.confidence.toFixed(2)}`);
+    console.log(`[Pipeline] Portrait zone: left=${portraitZone.left} top=${portraitZone.top} w=${portraitZone.width} h=${portraitZone.height}`);
 
     if (portraitZone.confidence < 0.25) {
       return {
@@ -103,22 +111,39 @@ export async function runBiometricPipeline(
           docDetectionConfidence:      docDetection.confidence,
           portraitDetectionMethod:     portraitZone.method,
           portraitDetectionConfidence: portraitZone.confidence,
+          selfieDetectionMethod:       'none',
+          selfieDetectionConfidence:   0,
           embeddingMethod:             'none',
           durationMs:                  Date.now() - startTime,
         },
       };
     }
 
-    // Étape 4 — Extraire et améliorer portraits
-    const enhancedPortrait = await enhancePortrait(docDetection.warpedBuffer, portraitZone);
-    const enhancedSelfie   = await enhancePortrait(selfieBuffer, {
-      left: 0, top: 0, width: selfieW, height: selfieH,
-    });
+    // ── Étape 4 : Localiser visage sur le selfie ──────────────────────────────
+    const selfieZone = await locatePortrait(selfieBuffer, selfieW, selfieH);
+    console.log(`[Pipeline] Portrait selfie: méthode=${selfieZone.method} confiance=${selfieZone.confidence.toFixed(2)}`);
 
-    // Étape 5 — Générer embeddings
+    // Si pas de visage détecté sur le selfie → utiliser toute l'image
+    const selfieExtract = selfieZone.confidence >= 0.4
+      ? selfieZone
+      : { left: 0, top: 0, width: selfieW, height: selfieH };
+
+    if (selfieZone.confidence < 0.4) {
+      console.log('[Pipeline] Selfie: pas de visage détecté, utilisation image complète');
+    }
+
+    // ── Étape 5 : Crop 112×112 pour ArcFace ──────────────────────────────────
+    const [docFace, selfieFace] = await Promise.all([
+      cropAndResize(docDetection.warpedBuffer, portraitZone),
+      cropAndResize(selfieBuffer, selfieExtract),
+    ]);
+
+    console.log(`[Pipeline] Faces extraites — doc: ${docFace.length}B selfie: ${selfieFace.length}B`);
+
+    // ── Étape 6 : Générer embeddings ArcFace ─────────────────────────────────
     const [docEmbed, selfieEmbed] = await Promise.all([
-      generateEmbedding(enhancedPortrait),
-      generateEmbedding(enhancedSelfie),
+      generateEmbedding(docFace),
+      generateEmbedding(selfieFace),
     ]);
 
     const embeddingMethod = docEmbed.method ?? 'unknown';
@@ -135,13 +160,15 @@ export async function runBiometricPipeline(
           docDetectionConfidence:      docDetection.confidence,
           portraitDetectionMethod:     portraitZone.method,
           portraitDetectionConfidence: portraitZone.confidence,
+          selfieDetectionMethod:       selfieZone.method,
+          selfieDetectionConfidence:   selfieZone.confidence,
           embeddingMethod,
           durationMs:                  Date.now() - startTime,
         },
       };
     }
 
-    // Étape 6 — Matching
+    // ── Étape 7 : Matching ────────────────────────────────────────────────────
     const matchResult = matchFaces(docEmbed.embedding, selfieEmbed.embedding, embeddingMethod);
     console.log(`[Pipeline] Match: score=${matchResult.similarityScore.toFixed(3)} matched=${matchResult.matched} risk=${matchResult.riskLevel}`);
 
@@ -152,13 +179,15 @@ export async function runBiometricPipeline(
       matched:           matchResult.matched,
       similarityScore:   matchResult.similarityScore,
       riskLevel:         matchResult.riskLevel,
-      livenessConfirmed: false, // liveness non implémenté ici (côté client)
+      livenessConfirmed: false,
       needsManualReview: matchResult.needsManualReview,
       failureReason:     matchResult.failureReason,
       debug: {
         docDetectionConfidence:      docDetection.confidence,
         portraitDetectionMethod:     portraitZone.method,
         portraitDetectionConfidence: portraitZone.confidence,
+        selfieDetectionMethod:       selfieZone.method,
+        selfieDetectionConfidence:   selfieZone.confidence,
         embeddingMethod,
         durationMs:                  elapsed,
       },
