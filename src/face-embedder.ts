@@ -6,7 +6,7 @@ const R2_MODELS_BASE = process.env.R2_MODELS_BASE_URL ||
   'https://pub-91a604b2df2f4a17b8aa07c2c2eee859.r2.dev/models/buffalo_l';
 
 const MODEL_URLS = {
-  arcface: `${R2_MODELS_BASE}/w600k_r50.onnx`,
+  arcface: `${R2_MODELS_BASE}/w600k_mbf.onnx`,
 };
 
 let arcfaceSession: any = null;
