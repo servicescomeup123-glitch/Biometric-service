@@ -32,16 +32,23 @@ export async function getDetector(): Promise<any | null> {
   if (detector) return detector;
   try {
     const ort         = await getOrtModule();
+    console.log('[Portrait] Téléchargement det_10g.onnx...');
     const modelBuffer = await downloadModel(MODEL_URLS.detection);
+    console.log('[Portrait] Modèle téléchargé, taille:', modelBuffer.byteLength, 'bytes');
     detector = await ort.InferenceSession.create(modelBuffer, {
       executionProviders:     ['cpu'],
       graphOptimizationLevel: 'all',
     });
-    console.log('[Portrait] Modèle chargé');
-    console.log('[Portrait] Inputs:', detector.inputNames);
-    console.log('[Portrait] Outputs:', detector.outputNames);
+    console.log('[Portrait] ✓ Modèle chargé avec succès');
+    console.log('[Portrait] Inputs:', JSON.stringify(detector.inputNames));
+    console.log('[Portrait] Outputs:', JSON.stringify(detector.outputNames));
+    // Log des dimensions de chaque output
+    for (const name of detector.outputNames) {
+      console.log(`[Portrait] Output "${name}" disponible`);
+    }
   } catch (err) {
-    console.warn('[Portrait] Modèle indisponible, fallback heuristique:', err);
+    console.error('[Portrait] ✗ Échec chargement modèle:', err);
+    detector = null;
   }
   return detector;
 }
@@ -132,7 +139,15 @@ async function detectWithONNX(
     for (const stride of strides) {
       const fH = Math.floor(INPUT_SIZE / stride);
       const fW = Math.floor(INPUT_SIZE / stride);
-      const N  = fH * fW * numAnchors; // nombre de détections pour ce stride
+      const N  = fH * fW * numAnchors;
+
+      console.log(`[Portrait ONNX] Stride ${stride}: cherche score(N=${N}) bbox(N*4=${N*4})`);
+
+      // Log toutes les tailles d'outputs pour debug
+      for (const name of session.outputNames) {
+        const d = results[name]?.data as Float32Array | undefined;
+        if (d) console.log(`[Portrait ONNX]   output "${name}" length=${d.length}`);
+      }
 
       // Trouver l'output de score pour ce stride (shape [N] ou [N,1] ou [1,N,1])
       const scoreOut = session.outputNames.find((name: string) => {
@@ -146,8 +161,10 @@ async function detectWithONNX(
         return d && d.length === N * 4;
       });
 
+      console.log(`[Portrait ONNX] Stride ${stride}: scoreOut=${scoreOut} bboxOut=${bboxOut}`);
+
       if (!scoreOut || !bboxOut) {
-        console.log(`[Portrait ONNX] Stride ${stride}: outputs non trouvés`);
+        console.log(`[Portrait ONNX] Stride ${stride}: outputs non trouvés — skip`);
         continue;
       }
 
