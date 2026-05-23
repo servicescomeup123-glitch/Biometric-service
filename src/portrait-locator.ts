@@ -28,7 +28,7 @@ async function downloadModel(url: string): Promise<ArrayBuffer> {
   return response.arrayBuffer();
 }
 
-async function getDetector(): Promise<any | null> {
+export async function getDetector(): Promise<any | null> {
   if (detector) return detector;
   try {
     const ort         = await getOrtModule();
@@ -100,7 +100,7 @@ async function detectWithONNX(
     }
 
     const inputTensor = new ort.Tensor('float32', tensor, [1, 3, 128, 128]);
-    const results     = await session.run({ input: inputTensor });
+    const results = await session.run({ "input.1": inputTensor });
 
     const boxes = results['boxes']?.data as Float32Array | undefined;
     if (!boxes || boxes.length < 5) return null;

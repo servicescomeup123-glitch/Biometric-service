@@ -52,9 +52,16 @@ app.post('/biometric/match', authMiddleware, async (req: Request, res: Response)
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[Server] Biometric service démarré sur le port ${PORT}`);
   console.log(`[Server] SERVICE_SECRET_KEY: ${process.env.SERVICE_SECRET_KEY ? '✓ configurée' : '⚠ non configurée (dev mode)'}`);
   console.log(`[Server] R2_MODELS_BASE_URL: ${process.env.R2_MODELS_BASE_URL ?? 'défaut pub-91a...'}`);
   console.log(`[Server] ANTHROPIC_API_KEY:  ${process.env.ANTHROPIC_API_KEY ? '✓ configurée' : '✗ manquante'}`);
+
+  // Pré-charger les modèles au boot — évite le timeout au premier appel
+  console.log('[Server] Pré-chargement des modèles ONNX...');
+  const { getArcFaceSession } = await import('./face-embedder');
+  const { getDetector }       = await import('./portrait-locator');
+  await Promise.all([getArcFaceSession(), getDetector()]);
+  console.log('[Server] Modèles prêts.');
 });

@@ -28,7 +28,7 @@ async function downloadModel(url: string): Promise<ArrayBuffer> {
   return response.arrayBuffer();
 }
 
-async function getArcFaceSession(): Promise<any | null> {
+export async function getArcFaceSession(): Promise<any | null> {
   if (arcfaceSession) return arcfaceSession;
   if (onnxAvailable === false) return null;
 
