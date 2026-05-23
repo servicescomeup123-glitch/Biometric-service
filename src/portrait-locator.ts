@@ -38,6 +38,8 @@ export async function getDetector(): Promise<any | null> {
       graphOptimizationLevel: 'all',
     });
     console.log('[Portrait] Modèle chargé');
+    console.log('[Portrait] Inputs:', detector.inputNames);
+    console.log('[Portrait] Outputs:', detector.outputNames);
   } catch (err) {
     console.warn('[Portrait] Modèle indisponible, fallback heuristique:', err);
   }
@@ -66,7 +68,7 @@ export async function locatePortrait(
   const session = await getDetector();
   if (session) {
     const zone = await detectWithONNX(session, warpedBuffer, originalW, originalH);
-    if (zone && zone.confidence > 0.6) {
+    if (zone && zone.confidence > 0.5) {
       console.log('[Portrait] ONNX réussi - confiance:', zone.confidence.toFixed(2));
       return zone;
     }
@@ -76,7 +78,7 @@ export async function locatePortrait(
   return heuristicPortraitZone(warpedBuffer, originalW, originalH);
 }
 
-// ─── Détection ONNX ───────────────────────────────────────────────────────────
+// ─── Détection ONNX (SCRFD / det_10g) ────────────────────────────────────────
 
 async function detectWithONNX(
   session: any,
@@ -87,42 +89,117 @@ async function detectWithONNX(
   try {
     const ort = await getOrtModule();
 
+    // det_10g est entraîné sur 640×640 — taille critique
+    const INPUT_SIZE = 640;
+
     const resized = await sharp(imageBuffer)
-      .resize(128, 128, { fit: 'fill' })
+      .resize(INPUT_SIZE, INPUT_SIZE, { fit: 'fill', kernel: 'lanczos3' })
+      .removeAlpha()
       .raw()
       .toBuffer();
 
-    const tensor = new Float32Array(3 * 128 * 128);
-    for (let i = 0; i < 128 * 128; i++) {
-      tensor[i]                 = resized[i * 3]     / 255.0;
-      tensor[128 * 128 + i]     = resized[i * 3 + 1] / 255.0;
-      tensor[2 * 128 * 128 + i] = resized[i * 3 + 2] / 255.0;
+    // Normalisation InsightFace : (pixel - 127.5) / 128
+    const tensor = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
+    for (let i = 0; i < INPUT_SIZE * INPUT_SIZE; i++) {
+      tensor[i]                               = (resized[i * 3]     - 127.5) / 128.0;
+      tensor[INPUT_SIZE * INPUT_SIZE + i]     = (resized[i * 3 + 1] - 127.5) / 128.0;
+      tensor[2 * INPUT_SIZE * INPUT_SIZE + i] = (resized[i * 3 + 2] - 127.5) / 128.0;
     }
 
-    const inputTensor = new ort.Tensor('float32', tensor, [1, 3, 128, 128]);
-    const results = await session.run({ "input.1": inputTensor });
+    const inputName   = session.inputNames[0];
+    const inputTensor = new ort.Tensor('float32', tensor, [1, 3, INPUT_SIZE, INPUT_SIZE]);
 
-    const boxes = results['boxes']?.data as Float32Array | undefined;
-    if (!boxes || boxes.length < 5) return null;
+    console.log('[Portrait ONNX] Run — input:', inputName,
+      '| outputs:', session.outputNames.join(', '));
 
-    const confidence = boxes[4];
-    if (confidence < 0.5) return null;
+    const results = await session.run({ [inputName]: inputTensor });
 
-    const x1 = Math.floor(boxes[0] * W);
-    const y1 = Math.floor(boxes[1] * H);
-    const x2 = Math.floor(boxes[2] * W);
-    const y2 = Math.floor(boxes[3] * H);
+    // ── Parser les outputs SCRFD multi-échelle ────────────────────────────────
+    // det_10g produit 6 outputs pour les strides 8, 16, 32 :
+    //   score_stride_X  : [1, H*W*2, 1]  — probabilité de visage
+    //   bbox_stride_X   : [1, H*W*2, 4]  — régression bbox (distance aux 4 côtés)
+    //
+    // En pratique les outputNames sont dans l'ordre :
+    //   [score_8, score_16, score_32, bbox_8, bbox_16, bbox_32]   (ordre InsightFace)
+    // ou numérotés différemment selon l'export — on les identifie par leur taille.
 
-    const margin = Math.min((x2 - x1) * 0.15, (y2 - y1) * 0.15);
+    const strides     = [8, 16, 32];
+    const numAnchors  = 2; // SCRFD 10G : 2 anchors par cellule
 
-    return {
-      left:       Math.max(0, x1 - margin),
-      top:        Math.max(0, y1 - margin),
-      width:      Math.min(W, x2 - x1 + 2 * margin),
-      height:     Math.min(H, y2 - y1 + 2 * margin),
-      confidence,
-      method:     'onnx_face_detection',
-    };
+    let topScore = 0;
+    let topBox: { x1: number; y1: number; x2: number; y2: number } | null = null;
+
+    for (const stride of strides) {
+      const fH = Math.floor(INPUT_SIZE / stride);
+      const fW = Math.floor(INPUT_SIZE / stride);
+      const N  = fH * fW * numAnchors; // nombre de détections pour ce stride
+
+      // Trouver l'output de score pour ce stride (shape [N] ou [N,1] ou [1,N,1])
+      const scoreOut = session.outputNames.find((name: string) => {
+        const d = results[name]?.data as Float32Array | undefined;
+        return d && d.length === N;
+      });
+
+      // Trouver l'output de bbox pour ce stride (shape [N*4] ou [N,4] ou [1,N,4])
+      const bboxOut = session.outputNames.find((name: string) => {
+        const d = results[name]?.data as Float32Array | undefined;
+        return d && d.length === N * 4;
+      });
+
+      if (!scoreOut || !bboxOut) {
+        console.log(`[Portrait ONNX] Stride ${stride}: outputs non trouvés`);
+        continue;
+      }
+
+      const scores = results[scoreOut].data as Float32Array;
+      const bboxes = results[bboxOut].data  as Float32Array;
+
+      // Générer les centres d'anchors pour ce stride
+      const anchorCenters: Array<[number, number]> = [];
+      for (let y = 0; y < fH; y++) {
+        for (let x = 0; x < fW; x++) {
+          for (let a = 0; a < numAnchors; a++) {
+            anchorCenters.push([(x + 0.5) * stride, (y + 0.5) * stride]);
+          }
+        }
+      }
+
+      for (let i = 0; i < N; i++) {
+        const score = scores[i];
+        if (score < 0.4 || score <= topScore) continue;
+
+        const [ax, ay] = anchorCenters[i];
+
+        // SCRFD bbox = distance depuis le centre de l'anchor
+        const x1 = (ax - bboxes[i * 4 + 0] * stride) / INPUT_SIZE * W;
+        const y1 = (ay - bboxes[i * 4 + 1] * stride) / INPUT_SIZE * H;
+        const x2 = (ax + bboxes[i * 4 + 2] * stride) / INPUT_SIZE * W;
+        const y2 = (ay + bboxes[i * 4 + 3] * stride) / INPUT_SIZE * H;
+
+        topScore = score;
+        topBox   = { x1, y1, x2, y2 };
+      }
+    }
+
+    if (!topBox) {
+      console.log('[Portrait ONNX] Aucun visage détecté (score max < seuil)');
+      return null;
+    }
+
+    const boxW   = topBox.x2 - topBox.x1;
+    const boxH   = topBox.y2 - topBox.y1;
+    const margin = Math.min(boxW, boxH) * 0.25;
+
+    const left   = Math.max(0, Math.floor(topBox.x1 - margin));
+    const top    = Math.max(0, Math.floor(topBox.y1 - margin));
+    const width  = Math.min(W - left, Math.ceil(boxW + 2 * margin));
+    const height = Math.min(H - top,  Math.ceil(boxH + 2 * margin));
+
+    console.log(`[Portrait ONNX] Visage trouvé — score: ${topScore.toFixed(3)}`,
+      `box: [${left},${top},${width}x${height}]`);
+
+    return { left, top, width, height, confidence: topScore, method: 'onnx_face_detection' };
+
   } catch (err) {
     console.error('[Portrait ONNX] Erreur:', err);
     return null;
@@ -155,7 +232,7 @@ async function heuristicPortraitZone(
 
         let sum = 0, sumSq = 0;
         for (const v of raw) { sum += v; sumSq += v * v; }
-        const mean     = sum / raw.length;
+        const mean        = sum / raw.length;
         variances[gy][gx] = sumSq / raw.length - mean * mean;
       } catch {
         variances[gy][gx] = 0;
