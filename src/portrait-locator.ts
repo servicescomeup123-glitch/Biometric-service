@@ -42,10 +42,6 @@ export async function getDetector(): Promise<any | null> {
     console.log('[Portrait] ✓ Modèle chargé avec succès');
     console.log('[Portrait] Inputs:', JSON.stringify(detector.inputNames));
     console.log('[Portrait] Outputs:', JSON.stringify(detector.outputNames));
-    // Log des dimensions de chaque output
-    for (const name of detector.outputNames) {
-      console.log(`[Portrait] Output "${name}" disponible`);
-    }
   } catch (err) {
     console.error('[Portrait] ✗ Échec chargement modèle:', err);
     detector = null;
@@ -53,7 +49,7 @@ export async function getDetector(): Promise<any | null> {
   return detector;
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface PortraitZone {
   left:       number;
@@ -85,7 +81,24 @@ export async function locatePortrait(
   return heuristicPortraitZone(warpedBuffer, originalW, originalH);
 }
 
-// ─── Détection ONNX (SCRFD / det_10g) ────────────────────────────────────────
+// ─── Détection ONNX (SCRFD det_10g) ──────────────────────────────────────────
+//
+// Outputs confirmés par run test :
+//   "448" → [12800,1]  scores stride 8  (80×80×2 anchors)
+//   "471" → [3200,1]   scores stride 16 (40×40×2 anchors)
+//   "494" → [800,1]    scores stride 32 (20×20×2 anchors)
+//   "451" → [12800,4]  bbox   stride 8
+//   "474" → [3200,4]   bbox   stride 16
+//   "497" → [800,4]    bbox   stride 32
+//   "454","477","500"  keypoints — ignorés
+
+const SCRFD_STRIDE_MAP = [
+  { stride: 8,  N: 12800, scoreOut: '448', bboxOut: '451' },
+  { stride: 16, N: 3200,  scoreOut: '471', bboxOut: '474' },
+  { stride: 32, N: 800,   scoreOut: '494', bboxOut: '497' },
+];
+const INPUT_SIZE  = 640;
+const NUM_ANCHORS = 2;
 
 async function detectWithONNX(
   session: any,
@@ -95,9 +108,6 @@ async function detectWithONNX(
 ): Promise<PortraitZone | null> {
   try {
     const ort = await getOrtModule();
-
-    // det_10g est entraîné sur 640×640 — taille critique
-    const INPUT_SIZE = 640;
 
     const resized = await sharp(imageBuffer)
       .resize(INPUT_SIZE, INPUT_SIZE, { fit: 'fill', kernel: 'lanczos3' })
@@ -113,81 +123,45 @@ async function detectWithONNX(
       tensor[2 * INPUT_SIZE * INPUT_SIZE + i] = (resized[i * 3 + 2] - 127.5) / 128.0;
     }
 
-    const inputName   = session.inputNames[0];
+    const inputName   = session.inputNames[0]; // "input.1"
     const inputTensor = new ort.Tensor('float32', tensor, [1, 3, INPUT_SIZE, INPUT_SIZE]);
-
-    console.log('[Portrait ONNX] Run — input:', inputName,
-      '| outputs:', session.outputNames.join(', '));
-
-    const results = await session.run({ [inputName]: inputTensor });
-
-    // ── Parser les outputs SCRFD multi-échelle ────────────────────────────────
-    // det_10g produit 6 outputs pour les strides 8, 16, 32 :
-    //   score_stride_X  : [1, H*W*2, 1]  — probabilité de visage
-    //   bbox_stride_X   : [1, H*W*2, 4]  — régression bbox (distance aux 4 côtés)
-    //
-    // En pratique les outputNames sont dans l'ordre :
-    //   [score_8, score_16, score_32, bbox_8, bbox_16, bbox_32]   (ordre InsightFace)
-    // ou numérotés différemment selon l'export — on les identifie par leur taille.
-
-    const strides     = [8, 16, 32];
-    const numAnchors  = 2; // SCRFD 10G : 2 anchors par cellule
+    const results     = await session.run({ [inputName]: inputTensor });
 
     let topScore = 0;
     let topBox: { x1: number; y1: number; x2: number; y2: number } | null = null;
 
-    for (const stride of strides) {
-      const fH = Math.floor(INPUT_SIZE / stride);
-      const fW = Math.floor(INPUT_SIZE / stride);
-      const N  = fH * fW * numAnchors;
+    for (const { stride, N, scoreOut, bboxOut } of SCRFD_STRIDE_MAP) {
+      const scores = results[scoreOut]?.data as Float32Array | undefined;
+      const bboxes = results[bboxOut]?.data  as Float32Array | undefined;
 
-      console.log(`[Portrait ONNX] Stride ${stride}: cherche score(N=${N}) bbox(N*4=${N*4})`);
-
-      // Log toutes les tailles d'outputs pour debug
-      for (const name of session.outputNames) {
-        const d = results[name]?.data as Float32Array | undefined;
-        if (d) console.log(`[Portrait ONNX]   output "${name}" length=${d.length}`);
-      }
-
-      // Trouver l'output de score pour ce stride (shape [N] ou [N,1] ou [1,N,1])
-      const scoreOut = session.outputNames.find((name: string) => {
-        const d = results[name]?.data as Float32Array | undefined;
-        return d && d.length === N;
-      });
-
-      // Trouver l'output de bbox pour ce stride (shape [N*4] ou [N,4] ou [1,N,4])
-      const bboxOut = session.outputNames.find((name: string) => {
-        const d = results[name]?.data as Float32Array | undefined;
-        return d && d.length === N * 4;
-      });
-
-      console.log(`[Portrait ONNX] Stride ${stride}: scoreOut=${scoreOut} bboxOut=${bboxOut}`);
-
-      if (!scoreOut || !bboxOut) {
-        console.log(`[Portrait ONNX] Stride ${stride}: outputs non trouvés — skip`);
+      if (!scores || !bboxes) {
+        console.warn(`[Portrait ONNX] Stride ${stride}: outputs "${scoreOut}"/"${bboxOut}" manquants`);
         continue;
       }
 
-      const scores = results[scoreOut].data as Float32Array;
-      const bboxes = results[bboxOut].data  as Float32Array;
-
-      // Générer les centres d'anchors pour ce stride
-      const anchorCenters: Array<[number, number]> = [];
-      for (let y = 0; y < fH; y++) {
-        for (let x = 0; x < fW; x++) {
-          for (let a = 0; a < numAnchors; a++) {
-            anchorCenters.push([(x + 0.5) * stride, (y + 0.5) * stride]);
-          }
-        }
+      if (scores.length !== N || bboxes.length !== N * 4) {
+        console.warn(`[Portrait ONNX] Stride ${stride}: taille inattendue scores=${scores.length} bboxes=${bboxes.length}`);
+        continue;
       }
 
+      const fH = Math.floor(INPUT_SIZE / stride);
+      const fW = Math.floor(INPUT_SIZE / stride);
+
+      // Générer les centres d'anchors (ordre row-major, NUM_ANCHORS par cellule)
       for (let i = 0; i < N; i++) {
         const score = scores[i];
         if (score < 0.4 || score <= topScore) continue;
 
-        const [ax, ay] = anchorCenters[i];
+        const anchorIdx = i % NUM_ANCHORS;
+        const cellIdx   = Math.floor(i / NUM_ANCHORS);
+        const cx_cell   = cellIdx % fW;
+        const cy_cell   = Math.floor(cellIdx / fW);
 
-        // SCRFD bbox = distance depuis le centre de l'anchor
+        // Centre de l'anchor en pixels (espace input 640×640)
+        const ax = (cx_cell * NUM_ANCHORS + anchorIdx + 0.5) * stride;
+        const ay = (cy_cell + 0.5) * stride;
+
+        // SCRFD : bbox = distances depuis le centre (l, t, r, b) * stride
         const x1 = (ax - bboxes[i * 4 + 0] * stride) / INPUT_SIZE * W;
         const y1 = (ay - bboxes[i * 4 + 1] * stride) / INPUT_SIZE * H;
         const x2 = (ax + bboxes[i * 4 + 2] * stride) / INPUT_SIZE * W;
@@ -199,7 +173,7 @@ async function detectWithONNX(
     }
 
     if (!topBox) {
-      console.log('[Portrait ONNX] Aucun visage détecté (score max < seuil)');
+      console.log('[Portrait ONNX] Aucun visage détecté (score max < 0.4)');
       return null;
     }
 
@@ -212,8 +186,10 @@ async function detectWithONNX(
     const width  = Math.min(W - left, Math.ceil(boxW + 2 * margin));
     const height = Math.min(H - top,  Math.ceil(boxH + 2 * margin));
 
-    console.log(`[Portrait ONNX] Visage trouvé — score: ${topScore.toFixed(3)}`,
-      `box: [${left},${top},${width}x${height}]`);
+    console.log(
+      `[Portrait ONNX] ✓ Visage — score: ${topScore.toFixed(3)}` +
+      ` zone: [${left},${top} ${width}×${height}]`,
+    );
 
     return { left, top, width, height, confidence: topScore, method: 'onnx_face_detection' };
 
@@ -223,7 +199,7 @@ async function detectWithONNX(
   }
 }
 
-// ─── Heuristique documentaire ─────────────────────────────────────────────────
+// ─── Heuristique documentaire (fallback) ─────────────────────────────────────
 
 async function heuristicPortraitZone(
   imageBuffer: Buffer,
