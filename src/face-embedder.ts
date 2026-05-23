@@ -69,6 +69,8 @@ export async function generateEmbedding(
       const resized = await sharp(portraitBuffer)
         .resize(112, 112, { fit: 'fill', kernel: 'lanczos3' })
         .removeAlpha()
+        .normalize()          // ← étale l'histogramme (compense photo sombre/claire)
+        .sharpen({ sigma: 0.5 }) // ← compense légère compression JPEG
         .raw()
         .toBuffer();
 
