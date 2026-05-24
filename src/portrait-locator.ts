@@ -75,9 +75,16 @@ export async function locatePortrait(
       console.log('[Portrait] ONNX réussi - confiance:', zone.confidence.toFixed(2));
       return zone;
     }
+    // ONNX a tourné mais n'a pas trouvé de visage avec assez de confiance
+    console.warn('[Portrait] ONNX insuffisant — NE PAS fallback sur heuristique, retour null');
+    return {
+      left: 0, top: 0, width: originalW, height: originalH,
+      confidence: 0,
+      method: 'heuristic_zone', // signalé comme heuristique pour bloquer en amont
+    };
   }
 
-  console.log('[Portrait] Fallback heuristique');
+  console.log('[Portrait] Session ONNX indisponible — fallback heuristique');
   return heuristicPortraitZone(warpedBuffer, originalW, originalH);
 }
 
@@ -91,6 +98,9 @@ export async function locatePortrait(
 //   "474" → [3200,4]   bbox   stride 16
 //   "497" → [800,4]    bbox   stride 32
 //   "454","477","500"  keypoints — ignorés
+//
+// FIX: les deltas bbox SCRFD sont en unités de stride, pas en pixels bruts.
+// Il faut multiplier par stride AVANT de remettre à l'échelle de l'image originale.
 
 const SCRFD_STRIDE_MAP = [
   { stride: 8,  N: 12800, scoreOut: '448', bboxOut: '451' },
@@ -147,8 +157,6 @@ async function detectWithONNX(
       const fH = Math.floor(INPUT_SIZE / stride);
       const fW = Math.floor(INPUT_SIZE / stride);
 
-      // Centres d'anchors selon InsightFace officiel :
-      // les NUM_ANCHORS anchors d'une même cellule partagent le même centre
       for (let i = 0; i < N; i++) {
         const score = scores[i];
         if (score < 0.4 || score <= topScore) continue;
@@ -157,15 +165,27 @@ async function detectWithONNX(
         const cx_cell = cellIdx % fW;
         const cy_cell = Math.floor(cellIdx / fW);
 
-        // Centre identique pour tous les anchors de cette cellule
+        // Centre de l'anchor en pixels dans l'espace INPUT_SIZE
         const ax = (cx_cell + 0.5) * stride;
         const ay = (cy_cell + 0.5) * stride;
 
-        // SCRFD : les deltas bbox sont déjà en pixels (pas besoin de * stride)
-        const x1 = (ax - bboxes[i * 4 + 0]) / INPUT_SIZE * W;
-        const y1 = (ay - bboxes[i * 4 + 1]) / INPUT_SIZE * H;
-        const x2 = (ax + bboxes[i * 4 + 2]) / INPUT_SIZE * W;
-        const y2 = (ay + bboxes[i * 4 + 3]) / INPUT_SIZE * H;
+        // FIX : les deltas SCRFD sont en unités stride → multiplier par stride
+        // pour obtenir des pixels dans l'espace INPUT_SIZE, puis remettre à
+        // l'échelle de l'image originale.
+        const dx1 = bboxes[i * 4 + 0] * stride;
+        const dy1 = bboxes[i * 4 + 1] * stride;
+        const dx2 = bboxes[i * 4 + 2] * stride;
+        const dy2 = bboxes[i * 4 + 3] * stride;
+
+        const x1 = (ax - dx1) / INPUT_SIZE * W;
+        const y1 = (ay - dy1) / INPUT_SIZE * H;
+        const x2 = (ax + dx2) / INPUT_SIZE * W;
+        const y2 = (ay + dy2) / INPUT_SIZE * H;
+
+        // Sanité : la bbox doit être dans l'image et avoir une taille raisonnable
+        if (x2 <= x1 || y2 <= y1) continue;
+        const bw = x2 - x1, bh = y2 - y1;
+        if (bw < 10 || bh < 10 || bw > W || bh > H) continue;
 
         topScore = score;
         topBox   = { x1, y1, x2, y2 };
@@ -200,6 +220,10 @@ async function detectWithONNX(
 }
 
 // ─── Heuristique documentaire (fallback) ─────────────────────────────────────
+// Utilisé uniquement quand le modèle ONNX est totalement indisponible (crash,
+// timeout réseau au chargement). NE PAS utiliser comme fallback silencieux
+// quand ONNX tourne mais ne trouve pas de visage — cela produirait des
+// embeddings sur des zones arbitraires et fausserait la comparaison.
 
 async function heuristicPortraitZone(
   imageBuffer: Buffer,
@@ -245,7 +269,7 @@ async function heuristicPortraitZone(
   }
 
   if (maxVariance === 0) {
-    return { left: 0, top: 0, width: W, height: H, confidence: 0.2, method: 'full_document' };
+    return { left: 0, top: 0, width: W, height: H, confidence: 0.1, method: 'full_document' };
   }
 
   const portraitLeft   = Math.max(0, (bestGx - 1) * cellW);
@@ -259,7 +283,8 @@ async function heuristicPortraitZone(
     top:        portraitTop,
     width:      portraitWidth,
     height:     portraitHeight,
-    confidence: (ratio >= 0.6 && ratio <= 1.5) ? 0.55 : 0.35,
+    // Confidence volontairement basse pour signaler l'incertitude en amont
+    confidence: (ratio >= 0.6 && ratio <= 1.5) ? 0.40 : 0.20,
     method:     'heuristic_zone',
   };
 }
