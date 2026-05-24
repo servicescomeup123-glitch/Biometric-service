@@ -49,23 +49,101 @@ async function normalizeInput(
   return { buffer, width, height };
 }
 
+// ─── Correction d'orientation du document ─────────────────────────────────────
+// Une carte d'identité est toujours en paysage (largeur > hauteur).
+// Si l'image est en portrait, on teste les deux rotations possibles (90° et -90°)
+// et on garde celle qui donne le meilleur score de détection de visage.
+
+async function correctDocumentOrientation(
+  buffer: Buffer,
+  width: number,
+  height: number,
+): Promise<{ buffer: Buffer; width: number; height: number }> {
+
+  // Déjà en paysage → rien à faire
+  if (width >= height) {
+    return { buffer, width, height };
+  }
+
+  console.log(`[Pipeline] Document en portrait (${width}×${height}) — correction orientation...`);
+
+  // Tenter rotation +90°
+  const rot90 = await sharp(buffer).rotate(90).jpeg({ quality: 90 }).toBuffer();
+  const meta90 = await sharp(rot90).metadata();
+  const w90 = meta90.width ?? height;
+  const h90 = meta90.height ?? width;
+
+  // Tenter rotation -90°
+  const rotN90 = await sharp(buffer).rotate(-90).jpeg({ quality: 90 }).toBuffer();
+  const metaN90 = await sharp(rotN90).metadata();
+  const wN90 = metaN90.width ?? height;
+  const hN90 = metaN90.height ?? width;
+
+  // Tester la détection de portrait sur les deux rotations
+  // et garder celle avec la meilleure confiance
+  const [zone90, zoneN90] = await Promise.all([
+    locatePortrait(rot90,  w90,  h90),
+    locatePortrait(rotN90, wN90, hN90),
+  ]);
+
+  console.log(
+    `[Pipeline] Rotation +90°: confiance=${zone90.confidence.toFixed(2)}` +
+    ` | Rotation -90°: confiance=${zoneN90.confidence.toFixed(2)}`
+  );
+
+  if (zone90.confidence >= zoneN90.confidence) {
+    console.log('[Pipeline] → Rotation +90° retenue');
+    return { buffer: rot90, width: w90, height: h90 };
+  } else {
+    console.log('[Pipeline] → Rotation -90° retenue');
+    return { buffer: rotN90, width: wN90, height: hN90 };
+  }
+}
+
 // ─── Crop + resize vers 112×112 pour ArcFace ─────────────────────────────────
 
 async function cropAndResize(
   imageBuffer: Buffer,
   zone: { left: number; top: number; width: number; height: number },
+  imageW: number,
+  imageH: number,
 ): Promise<Buffer> {
+  // Clamp explicite pour éviter les dépassements de bords
+  const left   = Math.max(0, Math.round(zone.left));
+  const top    = Math.max(0, Math.round(zone.top));
+  const width  = Math.min(imageW - left, Math.max(1, Math.round(zone.width)));
+  const height = Math.min(imageH - top,  Math.max(1, Math.round(zone.height)));
+
   return sharp(imageBuffer)
-    .extract({
-      left:   Math.max(0, Math.round(zone.left)),
-      top:    Math.max(0, Math.round(zone.top)),
-      width:  Math.max(1, Math.round(zone.width)),
-      height: Math.max(1, Math.round(zone.height)),
-    })
+    .extract({ left, top, width, height })
     .resize(112, 112, { fit: 'fill', kernel: 'lanczos3' })
     .removeAlpha()
     .jpeg({ quality: 95 })
     .toBuffer();
+}
+
+// ─── Validation du portrait extrait ──────────────────────────────────────────
+// Un portrait trop petit (< 5% de la surface du document) est suspect —
+// probablement une fausse détection sur un logo ou un tampon.
+
+function isPortraitZoneValid(
+  zone: { width: number; height: number; confidence: number },
+  imageW: number,
+  imageH: number,
+): boolean {
+  const docArea      = imageW * imageH;
+  const portraitArea = zone.width * zone.height;
+  const ratio        = portraitArea / docArea;
+
+  if (ratio < 0.02) {
+    console.warn(
+      `[Pipeline] Portrait trop petit: ${zone.width}×${zone.height}` +
+      ` = ${(ratio * 100).toFixed(1)}% de l'image — rejeté`
+    );
+    return false;
+  }
+
+  return true;
 }
 
 // ─── Détection document ───────────────────────────────────────────────────────
@@ -86,27 +164,38 @@ export async function runBiometricPipeline(
 
   try {
     // ── Étape 1 : Normaliser images ───────────────────────────────────────────
-    const { buffer: docBuffer, width: docW, height: docH } =
+    const { buffer: docBufferRaw, width: docWRaw, height: docHRaw } =
       await normalizeInput(input.documentImageBase64);
     const { buffer: selfieBuffer, width: selfieW, height: selfieH } =
       await normalizeInput(input.selfieBase64);
 
-    console.log(`[Pipeline] Doc: ${docW}×${docH} | Selfie: ${selfieW}×${selfieH}`);
+    console.log(`[Pipeline] Doc: ${docWRaw}×${docHRaw} | Selfie: ${selfieW}×${selfieH}`);
 
-    // ── Étape 2 : Détecter document ───────────────────────────────────────────
+    // ── Étape 2 : Corriger orientation du document ────────────────────────────
+    // Les cartes d'identité sont en paysage. Si le document est en portrait,
+    // on cherche la rotation qui place le visage correctement.
+    const { buffer: docBuffer, width: docW, height: docH } =
+      await correctDocumentOrientation(docBufferRaw, docWRaw, docHRaw);
+
+    if (docW !== docWRaw || docH !== docHRaw) {
+      console.log(`[Pipeline] Doc après correction: ${docW}×${docH}`);
+    }
+
+    // ── Étape 3 : Détecter document ───────────────────────────────────────────
     const docDetection = await detectDocument(docBuffer, docW, docH);
     console.log(`[Pipeline] Doc: confiance=${docDetection.confidence.toFixed(2)} méthode=${docDetection.method}`);
 
-    // ── Étape 3 : Localiser portrait sur le document ──────────────────────────
+    // ── Étape 4 : Localiser portrait sur le document ──────────────────────────
     const portraitZone = await locatePortrait(docDetection.warpedBuffer, docW, docH);
     console.log(`[Pipeline] Portrait doc: méthode=${portraitZone.method} confiance=${portraitZone.confidence.toFixed(2)}`);
     console.log(`[Pipeline] Portrait zone: left=${portraitZone.left} top=${portraitZone.top} w=${portraitZone.width} h=${portraitZone.height}`);
 
-    if (portraitZone.confidence < 0.25) {
+    // Rejeter si confiance trop faible OU zone trop petite (fausse détection)
+    if (portraitZone.confidence < 0.25 || !isPortraitZoneValid(portraitZone, docW, docH)) {
       return {
         matched: false, similarityScore: 0, riskLevel: 'high',
         livenessConfirmed: false, needsManualReview: true,
-        failureReason: 'Portrait non localisé sur le document',
+        failureReason: 'Portrait non localisé sur le document — veuillez reprendre la photo du document',
         debug: {
           docDetectionConfidence:      docDetection.confidence,
           portraitDetectionMethod:     portraitZone.method,
@@ -119,12 +208,13 @@ export async function runBiometricPipeline(
       };
     }
 
-    // ── Étape 4 : Localiser visage sur le selfie ──────────────────────────────
+    // ── Étape 5 : Localiser visage sur le selfie ──────────────────────────────
     const selfieZone = await locatePortrait(selfieBuffer, selfieW, selfieH);
     console.log(`[Pipeline] Portrait selfie: méthode=${selfieZone.method} confiance=${selfieZone.confidence.toFixed(2)}`);
 
-    // Si pas de visage détecté sur le selfie → utiliser toute l'image
-    const selfieExtract = selfieZone.confidence >= 0.4
+    // Pour le selfie : si pas de visage détecté, utiliser toute l'image
+    // (le selfie est une photo de face, ArcFace s'en sort mieux que sur un doc entier)
+    const selfieExtract = (selfieZone.confidence >= 0.4 && isPortraitZoneValid(selfieZone, selfieW, selfieH))
       ? selfieZone
       : { left: 0, top: 0, width: selfieW, height: selfieH };
 
@@ -132,15 +222,15 @@ export async function runBiometricPipeline(
       console.log('[Pipeline] Selfie: pas de visage détecté, utilisation image complète');
     }
 
-    // ── Étape 5 : Crop 112×112 pour ArcFace ──────────────────────────────────
+    // ── Étape 6 : Crop 112×112 pour ArcFace ──────────────────────────────────
     const [docFace, selfieFace] = await Promise.all([
-      cropAndResize(docDetection.warpedBuffer, portraitZone),
-      cropAndResize(selfieBuffer, selfieExtract),
+      cropAndResize(docDetection.warpedBuffer, portraitZone, docW, docH),
+      cropAndResize(selfieBuffer, selfieExtract, selfieW, selfieH),
     ]);
 
     console.log(`[Pipeline] Faces extraites — doc: ${docFace.length}B selfie: ${selfieFace.length}B`);
 
-    // ── Étape 6 : Générer embeddings ArcFace ─────────────────────────────────
+    // ── Étape 7 : Générer embeddings ArcFace ─────────────────────────────────
     const [docEmbed, selfieEmbed] = await Promise.all([
       generateEmbedding(docFace),
       generateEmbedding(selfieFace),
@@ -168,7 +258,7 @@ export async function runBiometricPipeline(
       };
     }
 
-    // ── Étape 7 : Matching ────────────────────────────────────────────────────
+    // ── Étape 8 : Matching ────────────────────────────────────────────────────
     const matchResult = matchFaces(docEmbed.embedding, selfieEmbed.embedding, embeddingMethod);
     console.log(`[Pipeline] Match: score=${matchResult.similarityScore.toFixed(3)} matched=${matchResult.matched} risk=${matchResult.riskLevel}`);
 
