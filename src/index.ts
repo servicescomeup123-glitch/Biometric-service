@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { runBiometricPipeline } from './pipeline';
+import * as fs from 'fs';
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -51,8 +52,39 @@ app.post('/biometric/match', authMiddleware, readyMiddleware, async (req: Reques
     ` selfie: ${Math.round(selfieBase64.length / 1024)}KB`,
   );
 
+  // ── Sauvegarde des images pour diagnostic ─────────────────────────────────
+  try {
+    const docData    = documentImageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const selfieData = selfieBase64.replace(/^data:image\/\w+;base64,/, '');
+    fs.writeFileSync('/tmp/last_doc.jpg',    Buffer.from(docData,    'base64'));
+    fs.writeFileSync('/tmp/last_selfie.jpg', Buffer.from(selfieData, 'base64'));
+    console.log('[Debug] Images sauvegardées dans /tmp/');
+  } catch (e) {
+    console.warn('[Debug] Impossible de sauvegarder les images:', e);
+  }
+
   const result = await runBiometricPipeline({ documentImageBase64, selfieBase64 });
   return res.json(result);
+});
+
+// ─── Endpoints de debug (à retirer en production) ─────────────────────────────
+
+app.get('/debug/doc', (_req, res) => {
+  if (fs.existsSync('/tmp/last_doc.jpg')) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.send(fs.readFileSync('/tmp/last_doc.jpg'));
+  } else {
+    res.status(404).send('Pas encore de document reçu');
+  }
+});
+
+app.get('/debug/selfie', (_req, res) => {
+  if (fs.existsSync('/tmp/last_selfie.jpg')) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.send(fs.readFileSync('/tmp/last_selfie.jpg'));
+  } else {
+    res.status(404).send('Pas encore de selfie reçu');
+  }
 });
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
