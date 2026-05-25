@@ -49,54 +49,98 @@ async function normalizeInput(
   return { buffer, width, height };
 }
 
-// ─── Correction d'orientation du document ─────────────────────────────────────
-// Une carte d'identité est toujours en paysage (largeur > hauteur).
-// Si l'image est en portrait, on teste les deux rotations possibles (90° et -90°)
-// et on garde celle qui donne le meilleur score de détection de visage.
+// ─── Extraction du portrait via Claude Vision ─────────────────────────────────
+// Claude reçoit l'image du document entier et retourne les coordonnées
+// du portrait en pourcentage (0-100) pour être indépendant de la résolution.
 
-async function correctDocumentOrientation(
-  buffer: Buffer,
-  width: number,
-  height: number,
-): Promise<{ buffer: Buffer; width: number; height: number }> {
+async function extractPortraitWithClaude(
+  imageBuffer: Buffer,
+  W: number,
+  H: number,
+): Promise<{ left: number; top: number; width: number; height: number; confidence: number } | null> {
 
-  // Déjà en paysage → rien à faire
-  if (width >= height) {
-    return { buffer, width, height };
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.warn('[Claude] ANTHROPIC_API_KEY manquante — skip extraction Claude');
+    return null;
   }
 
-  console.log(`[Pipeline] Document en portrait (${width}×${height}) — correction orientation...`);
+  try {
+    const base64 = imageBuffer.toString('base64');
 
-  // Tenter rotation +90°
-  const rot90 = await sharp(buffer).rotate(90).jpeg({ quality: 90 }).toBuffer();
-  const meta90 = await sharp(rot90).metadata();
-  const w90 = meta90.width ?? height;
-  const h90 = meta90.height ?? width;
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-5',
+        max_tokens: 256,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type:   'image',
+              source: { type: 'base64', media_type: 'image/jpeg', data: base64 },
+            },
+            {
+              type: 'text',
+              text: `Cette image contient un document d'identité (carte d'identité, passeport, permis).
+Localise UNIQUEMENT le portrait photo (visage de la personne) sur ce document.
+Réponds UNIQUEMENT en JSON strict, sans markdown :
+{
+  "found": true,
+  "x_pct": 15,
+  "y_pct": 30,
+  "w_pct": 20,
+  "h_pct": 35
+}
+Où x_pct/y_pct sont le coin supérieur gauche du portrait en % de l'image, et w_pct/h_pct la largeur/hauteur en %.
+Si tu ne vois pas de portrait clairement : { "found": false }`,
+            },
+          ],
+        }],
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
 
-  // Tenter rotation -90°
-  const rotN90 = await sharp(buffer).rotate(-90).jpeg({ quality: 90 }).toBuffer();
-  const metaN90 = await sharp(rotN90).metadata();
-  const wN90 = metaN90.width ?? height;
-  const hN90 = metaN90.height ?? width;
+    if (!response.ok) {
+      console.error('[Claude] Erreur API:', response.status);
+      return null;
+    }
 
-  // Tester la détection de portrait sur les deux rotations
-  // et garder celle avec la meilleure confiance
-  const [zone90, zoneN90] = await Promise.all([
-    locatePortrait(rot90,  w90,  h90),
-    locatePortrait(rotN90, wN90, hN90),
-  ]);
+    const result = await response.json();
+    const text   = (result.content?.[0]?.text ?? '').trim();
 
-  console.log(
-    `[Pipeline] Rotation +90°: confiance=${zone90.confidence.toFixed(2)}` +
-    ` | Rotation -90°: confiance=${zoneN90.confidence.toFixed(2)}`
-  );
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text.replace(/```json\s*/g, '').replace(/```/g, '').trim());
+    } catch {
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) return null;
+      parsed = JSON.parse(m[0]);
+    }
 
-  if (zone90.confidence >= zoneN90.confidence) {
-    console.log('[Pipeline] → Rotation +90° retenue');
-    return { buffer: rot90, width: w90, height: h90 };
-  } else {
-    console.log('[Pipeline] → Rotation -90° retenue');
-    return { buffer: rotN90, width: wN90, height: hN90 };
+    if (!parsed.found) {
+      console.log('[Claude] Portrait non trouvé dans le document');
+      return null;
+    }
+
+    // Convertir les pourcentages en pixels
+    const left   = Math.max(0, Math.round(parsed.x_pct / 100 * W));
+    const top    = Math.max(0, Math.round(parsed.y_pct / 100 * H));
+    const width  = Math.min(W - left, Math.round(parsed.w_pct / 100 * W));
+    const height = Math.min(H - top,  Math.round(parsed.h_pct / 100 * H));
+
+    console.log(`[Claude] Portrait trouvé: [${left},${top} ${width}×${height}]`);
+
+    return { left, top, width, height, confidence: 0.85 };
+
+  } catch (err) {
+    console.error('[Claude] Erreur extraction portrait:', err);
+    return null;
   }
 }
 
@@ -108,7 +152,6 @@ async function cropAndResize(
   imageW: number,
   imageH: number,
 ): Promise<Buffer> {
-  // Clamp explicite pour éviter les dépassements de bords
   const left   = Math.max(0, Math.round(zone.left));
   const top    = Math.max(0, Math.round(zone.top));
   const width  = Math.min(imageW - left, Math.max(1, Math.round(zone.width)));
@@ -120,30 +163,6 @@ async function cropAndResize(
     .removeAlpha()
     .jpeg({ quality: 95 })
     .toBuffer();
-}
-
-// ─── Validation du portrait extrait ──────────────────────────────────────────
-// Un portrait trop petit (< 5% de la surface du document) est suspect —
-// probablement une fausse détection sur un logo ou un tampon.
-
-function isPortraitZoneValid(
-  zone: { width: number; height: number; confidence: number },
-  imageW: number,
-  imageH: number,
-): boolean {
-  const docArea      = imageW * imageH;
-  const portraitArea = zone.width * zone.height;
-  const ratio        = portraitArea / docArea;
-
-  if (ratio < 0.02) {
-    console.warn(
-      `[Pipeline] Portrait trop petit: ${zone.width}×${zone.height}` +
-      ` = ${(ratio * 100).toFixed(1)}% de l'image — rejeté`
-    );
-    return false;
-  }
-
-  return true;
 }
 
 // ─── Détection document ───────────────────────────────────────────────────────
@@ -164,42 +183,49 @@ export async function runBiometricPipeline(
 
   try {
     // ── Étape 1 : Normaliser images ───────────────────────────────────────────
-    const { buffer: docBufferRaw, width: docWRaw, height: docHRaw } =
+    const { buffer: docBuffer, width: docW, height: docH } =
       await normalizeInput(input.documentImageBase64);
     const { buffer: selfieBuffer, width: selfieW, height: selfieH } =
       await normalizeInput(input.selfieBase64);
 
-    console.log(`[Pipeline] Doc: ${docWRaw}×${docHRaw} | Selfie: ${selfieW}×${selfieH}`);
+    console.log(`[Pipeline] Doc: ${docW}×${docH} | Selfie: ${selfieW}×${selfieH}`);
 
-    // ── Étape 2 : Corriger orientation du document ────────────────────────────
-    // Les cartes d'identité sont en paysage. Si le document est en portrait,
-    // on cherche la rotation qui place le visage correctement.
-    const { buffer: docBuffer, width: docW, height: docH } =
-      await correctDocumentOrientation(docBufferRaw, docWRaw, docHRaw);
-
-    if (docW !== docWRaw || docH !== docHRaw) {
-      console.log(`[Pipeline] Doc après correction: ${docW}×${docH}`);
-    }
-
-    // ── Étape 3 : Détecter document ───────────────────────────────────────────
+    // ── Étape 2 : Détecter document ───────────────────────────────────────────
     const docDetection = await detectDocument(docBuffer, docW, docH);
     console.log(`[Pipeline] Doc: confiance=${docDetection.confidence.toFixed(2)} méthode=${docDetection.method}`);
 
-    // ── Étape 4 : Localiser portrait sur le document ──────────────────────────
-    const portraitZone = await locatePortrait(docDetection.warpedBuffer, docW, docH);
-    console.log(`[Pipeline] Portrait doc: méthode=${portraitZone.method} confiance=${portraitZone.confidence.toFixed(2)}`);
-    console.log(`[Pipeline] Portrait zone: left=${portraitZone.left} top=${portraitZone.top} w=${portraitZone.width} h=${portraitZone.height}`);
+    // ── Étape 3 : Localiser portrait — Claude Vision en priorité ──────────────
+    // ONNX échoue quand le portrait est petit (carte posée sur table).
+    // Claude Vision comprend la scène et localise le portrait correctement.
+    let portraitZone: { left: number; top: number; width: number; height: number; confidence: number; method: string } | null = null;
 
-    // Rejeter si confiance trop faible OU zone trop petite (fausse détection)
-    if (portraitZone.confidence < 0.25 || !isPortraitZoneValid(portraitZone, docW, docH)) {
+    // 3a. Essayer Claude Vision d'abord
+    const claudeZone = await extractPortraitWithClaude(docDetection.warpedBuffer, docW, docH);
+    if (claudeZone) {
+      portraitZone = { ...claudeZone, method: 'claude_vision' };
+      console.log(`[Pipeline] Portrait doc (Claude): méthode=claude_vision confiance=${portraitZone.confidence.toFixed(2)}`);
+    }
+
+    // 3b. Fallback ONNX si Claude échoue
+    if (!portraitZone) {
+      console.log('[Pipeline] Claude Vision indisponible — fallback ONNX');
+      const onnxZone = await locatePortrait(docDetection.warpedBuffer, docW, docH);
+      if (onnxZone.confidence >= 0.3) {
+        portraitZone = onnxZone;
+        console.log(`[Pipeline] Portrait doc (ONNX): méthode=${onnxZone.method} confiance=${onnxZone.confidence.toFixed(2)}`);
+      }
+    }
+
+    // 3c. Blocage si aucun portrait trouvé
+    if (!portraitZone || portraitZone.confidence < 0.2) {
       return {
         matched: false, similarityScore: 0, riskLevel: 'high',
         livenessConfirmed: false, needsManualReview: true,
-        failureReason: 'Portrait non localisé sur le document — veuillez reprendre la photo du document',
+        failureReason: 'Portrait non localisé sur le document — veuillez reprendre la photo du document en vous assurant que le recto de la carte est bien visible',
         debug: {
           docDetectionConfidence:      docDetection.confidence,
-          portraitDetectionMethod:     portraitZone.method,
-          portraitDetectionConfidence: portraitZone.confidence,
+          portraitDetectionMethod:     portraitZone?.method ?? 'none',
+          portraitDetectionConfidence: portraitZone?.confidence ?? 0,
           selfieDetectionMethod:       'none',
           selfieDetectionConfidence:   0,
           embeddingMethod:             'none',
@@ -208,21 +234,21 @@ export async function runBiometricPipeline(
       };
     }
 
-    // ── Étape 5 : Localiser visage sur le selfie ──────────────────────────────
+    console.log(`[Pipeline] Portrait zone: left=${portraitZone.left} top=${portraitZone.top} w=${portraitZone.width} h=${portraitZone.height}`);
+
+    // ── Étape 4 : Localiser visage sur le selfie ──────────────────────────────
     const selfieZone = await locatePortrait(selfieBuffer, selfieW, selfieH);
     console.log(`[Pipeline] Portrait selfie: méthode=${selfieZone.method} confiance=${selfieZone.confidence.toFixed(2)}`);
 
-    // Pour le selfie : si pas de visage détecté, utiliser toute l'image
-    // (le selfie est une photo de face, ArcFace s'en sort mieux que sur un doc entier)
-    const selfieExtract = (selfieZone.confidence >= 0.4 && isPortraitZoneValid(selfieZone, selfieW, selfieH))
+    const selfieExtract = selfieZone.confidence >= 0.3
       ? selfieZone
       : { left: 0, top: 0, width: selfieW, height: selfieH };
 
-    if (selfieZone.confidence < 0.4) {
-      console.log('[Pipeline] Selfie: pas de visage détecté, utilisation image complète');
+    if (selfieZone.confidence < 0.3) {
+      console.log('[Pipeline] Selfie: pas de visage ONNX, utilisation image complète');
     }
 
-    // ── Étape 6 : Crop 112×112 pour ArcFace ──────────────────────────────────
+    // ── Étape 5 : Crop 112×112 pour ArcFace ──────────────────────────────────
     const [docFace, selfieFace] = await Promise.all([
       cropAndResize(docDetection.warpedBuffer, portraitZone, docW, docH),
       cropAndResize(selfieBuffer, selfieExtract, selfieW, selfieH),
@@ -230,7 +256,7 @@ export async function runBiometricPipeline(
 
     console.log(`[Pipeline] Faces extraites — doc: ${docFace.length}B selfie: ${selfieFace.length}B`);
 
-    // ── Étape 7 : Générer embeddings ArcFace ─────────────────────────────────
+    // ── Étape 6 : Générer embeddings ArcFace ─────────────────────────────────
     const [docEmbed, selfieEmbed] = await Promise.all([
       generateEmbedding(docFace),
       generateEmbedding(selfieFace),
@@ -258,7 +284,7 @@ export async function runBiometricPipeline(
       };
     }
 
-    // ── Étape 8 : Matching ────────────────────────────────────────────────────
+    // ── Étape 7 : Matching ────────────────────────────────────────────────────
     const matchResult = matchFaces(docEmbed.embedding, selfieEmbed.embedding, embeddingMethod);
     console.log(`[Pipeline] Match: score=${matchResult.similarityScore.toFixed(3)} matched=${matchResult.matched} risk=${matchResult.riskLevel}`);
 
