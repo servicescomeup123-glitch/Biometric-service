@@ -111,7 +111,7 @@ Si tu ne vois pas de portrait clairement : { "found": false }`,
       return null;
     }
 
-    const result = await response.json();
+    const result = await response.json() as { content?: { text?: string }[] };
     const text   = (result.content?.[0]?.text ?? '').trim();
 
     let parsed: any;
