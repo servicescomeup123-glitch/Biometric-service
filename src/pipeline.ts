@@ -240,13 +240,27 @@ export async function runBiometricPipeline(
     const selfieZone = await locatePortrait(selfieBuffer, selfieW, selfieH);
     console.log(`[Pipeline] Portrait selfie: méthode=${selfieZone.method} confiance=${selfieZone.confidence.toFixed(2)}`);
 
-    const selfieExtract = selfieZone.confidence >= 0.3
-      ? selfieZone
-      : { left: 0, top: 0, width: selfieW, height: selfieH };
-
+    // CRITIQUE : si aucun visage détecté sur le selfie → bloquer immédiatement.
+    // Ne jamais comparer avec l'image complète (rideau, mur, objet...).
     if (selfieZone.confidence < 0.3) {
-      console.log('[Pipeline] Selfie: pas de visage ONNX, utilisation image complète');
+      console.warn('[Pipeline] Selfie: aucun visage détecté — rejet immédiat');
+      return {
+        matched: false, similarityScore: 0, riskLevel: 'high',
+        livenessConfirmed: false, needsManualReview: true,
+        failureReason: 'Aucun visage détecté sur le selfie — veuillez reprendre la photo face à la caméra',
+        debug: {
+          docDetectionConfidence:      docDetection.confidence,
+          portraitDetectionMethod:     portraitZone.method,
+          portraitDetectionConfidence: portraitZone.confidence,
+          selfieDetectionMethod:       selfieZone.method,
+          selfieDetectionConfidence:   selfieZone.confidence,
+          embeddingMethod:             'none',
+          durationMs:                  Date.now() - startTime,
+        },
+      };
     }
+
+    const selfieExtract = selfieZone;
 
     // ── Étape 5 : Crop 112×112 pour ArcFace ──────────────────────────────────
     const [docFace, selfieFace] = await Promise.all([
