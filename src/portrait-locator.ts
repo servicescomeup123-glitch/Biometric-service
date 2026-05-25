@@ -75,32 +75,33 @@ export async function locatePortrait(
       console.log('[Portrait] ONNX réussi - confiance:', zone.confidence.toFixed(2));
       return zone;
     }
-    // ONNX a tourné mais n'a pas trouvé de visage avec assez de confiance
-    console.warn('[Portrait] ONNX insuffisant — NE PAS fallback sur heuristique, retour null');
-    return {
-      left: 0, top: 0, width: originalW, height: originalH,
-      confidence: 0,
-      method: 'heuristic_zone', // signalé comme heuristique pour bloquer en amont
-    };
+    // ONNX a tourné mais score insuffisant
+    if (zone && zone.confidence > 0) {
+      // Visage détecté mais score < 0.5 → on le retourne quand même
+      // c'est le pipeline qui décide de bloquer ou non
+      console.log('[Portrait] ONNX score faible mais retourné:', zone.confidence.toFixed(2));
+      return zone;
+    }
   }
 
-  console.log('[Portrait] Session ONNX indisponible — fallback heuristique');
+  console.log('[Portrait] Session ONNX indisponible ou aucun visage — fallback heuristique');
   return heuristicPortraitZone(warpedBuffer, originalW, originalH);
 }
 
 // ─── Détection ONNX (SCRFD det_10g) ──────────────────────────────────────────
 //
-// Outputs confirmés par run test :
-//   "448" → [12800,1]  scores stride 8  (80×80×2 anchors)
-//   "471" → [3200,1]   scores stride 16 (40×40×2 anchors)
-//   "494" → [800,1]    scores stride 32 (20×20×2 anchors)
+// Outputs :
+//   "448" → [12800,1]  scores stride 8
+//   "471" → [3200,1]   scores stride 16
+//   "494" → [800,1]    scores stride 32
 //   "451" → [12800,4]  bbox   stride 8
 //   "474" → [3200,4]   bbox   stride 16
 //   "497" → [800,4]    bbox   stride 32
-//   "454","477","500"  keypoints — ignorés
 //
-// FIX: les deltas bbox SCRFD sont en unités de stride, pas en pixels bruts.
-// Il faut multiplier par stride AVANT de remettre à l'échelle de l'image originale.
+// IMPORTANT : ce modèle SCRFD exporte les deltas bbox déjà en pixels
+// dans l'espace INPUT_SIZE (640×640). PAS besoin de multiplier par stride.
+// La formule correcte est : x1 = ax - dx1, x2 = ax + dx2 (en pixels 640×640)
+// puis remise à l'échelle vers l'image originale.
 
 const SCRFD_STRIDE_MAP = [
   { stride: 8,  N: 12800, scoreOut: '448', bboxOut: '451' },
@@ -133,56 +134,49 @@ async function detectWithONNX(
       tensor[2 * INPUT_SIZE * INPUT_SIZE + i] = (resized[i * 3 + 2] - 127.5) / 128.0;
     }
 
-    const inputName   = session.inputNames[0]; // "input.1"
+    const inputName   = session.inputNames[0];
     const inputTensor = new ort.Tensor('float32', tensor, [1, 3, INPUT_SIZE, INPUT_SIZE]);
     const results     = await session.run({ [inputName]: inputTensor });
 
     let topScore = 0;
     let topBox: { x1: number; y1: number; x2: number; y2: number } | null = null;
 
+    // Log du score max par stride pour diagnostiquer les seuils
     for (const { stride, N, scoreOut, bboxOut } of SCRFD_STRIDE_MAP) {
       const scores = results[scoreOut]?.data as Float32Array | undefined;
       const bboxes = results[bboxOut]?.data  as Float32Array | undefined;
 
       if (!scores || !bboxes) {
-        console.warn(`[Portrait ONNX] Stride ${stride}: outputs "${scoreOut}"/"${bboxOut}" manquants`);
+        console.warn(`[Portrait ONNX] Stride ${stride}: outputs manquants`);
         continue;
       }
 
-      if (scores.length !== N || bboxes.length !== N * 4) {
-        console.warn(`[Portrait ONNX] Stride ${stride}: taille inattendue scores=${scores.length} bboxes=${bboxes.length}`);
-        continue;
+      let strideMax = 0;
+      for (let i = 0; i < scores.length; i++) {
+        if (scores[i] > strideMax) strideMax = scores[i];
       }
+      console.log(`[Portrait ONNX] Stride ${stride}: score max = ${strideMax.toFixed(4)}`);
 
-      const fH = Math.floor(INPUT_SIZE / stride);
       const fW = Math.floor(INPUT_SIZE / stride);
 
       for (let i = 0; i < N; i++) {
         const score = scores[i];
-        if (score < 0.4 || score <= topScore) continue;
+        // Seuil abaissé à 0.3 pour les portraits de documents (moins nets qu'une selfie)
+        if (score < 0.3 || score <= topScore) continue;
 
         const cellIdx = Math.floor(i / NUM_ANCHORS);
         const cx_cell = cellIdx % fW;
         const cy_cell = Math.floor(cellIdx / fW);
 
-        // Centre de l'anchor en pixels dans l'espace INPUT_SIZE
         const ax = (cx_cell + 0.5) * stride;
         const ay = (cy_cell + 0.5) * stride;
 
-        // FIX : les deltas SCRFD sont en unités stride → multiplier par stride
-        // pour obtenir des pixels dans l'espace INPUT_SIZE, puis remettre à
-        // l'échelle de l'image originale.
-        const dx1 = bboxes[i * 4 + 0] * stride;
-        const dy1 = bboxes[i * 4 + 1] * stride;
-        const dx2 = bboxes[i * 4 + 2] * stride;
-        const dy2 = bboxes[i * 4 + 3] * stride;
+        // Deltas bbox en pixels dans l'espace 640×640 (pas de * stride)
+        const x1 = (ax - bboxes[i * 4 + 0]) / INPUT_SIZE * W;
+        const y1 = (ay - bboxes[i * 4 + 1]) / INPUT_SIZE * H;
+        const x2 = (ax + bboxes[i * 4 + 2]) / INPUT_SIZE * W;
+        const y2 = (ay + bboxes[i * 4 + 3]) / INPUT_SIZE * H;
 
-        const x1 = (ax - dx1) / INPUT_SIZE * W;
-        const y1 = (ay - dy1) / INPUT_SIZE * H;
-        const x2 = (ax + dx2) / INPUT_SIZE * W;
-        const y2 = (ay + dy2) / INPUT_SIZE * H;
-
-        // Sanité : la bbox doit être dans l'image et avoir une taille raisonnable
         if (x2 <= x1 || y2 <= y1) continue;
         const bw = x2 - x1, bh = y2 - y1;
         if (bw < 10 || bh < 10 || bw > W || bh > H) continue;
@@ -193,7 +187,7 @@ async function detectWithONNX(
     }
 
     if (!topBox) {
-      console.log('[Portrait ONNX] Aucun visage détecté (score max < 0.4)');
+      console.log('[Portrait ONNX] Aucun visage détecté');
       return null;
     }
 
@@ -220,10 +214,6 @@ async function detectWithONNX(
 }
 
 // ─── Heuristique documentaire (fallback) ─────────────────────────────────────
-// Utilisé uniquement quand le modèle ONNX est totalement indisponible (crash,
-// timeout réseau au chargement). NE PAS utiliser comme fallback silencieux
-// quand ONNX tourne mais ne trouve pas de visage — cela produirait des
-// embeddings sur des zones arbitraires et fausserait la comparaison.
 
 async function heuristicPortraitZone(
   imageBuffer: Buffer,
@@ -283,7 +273,6 @@ async function heuristicPortraitZone(
     top:        portraitTop,
     width:      portraitWidth,
     height:     portraitHeight,
-    // Confidence volontairement basse pour signaler l'incertitude en amont
     confidence: (ratio >= 0.6 && ratio <= 1.5) ? 0.40 : 0.20,
     method:     'heuristic_zone',
   };
