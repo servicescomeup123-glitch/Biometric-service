@@ -9,28 +9,34 @@ export interface FaceMatchDecision {
   failureReason?:    string;
 }
 
-// ─── Seuils ArcFace 512-dim (cosinus brut via (dot+1)/2) ─────────────────────
+// ─── Seuils ArcFace 512-dim — document imprimé vs selfie ─────────────────────
 //
-// cosinus brut → score affiché
-//   0.20  →  0.60   même personne limite basse
-//   0.35  →  0.675  match moyen
-//   0.50  →  0.75   bon match
-//   0.65  →  0.825  excellent match
+// Contexte réel observé (carte CEDEAO portrait N&B vs selfie couleur) :
+//   même personne   : score 0.62 – 0.72  (cosinus brut 0.24 – 0.44)
+//   personne diffs  : score < 0.55       (cosinus brut < 0.10)
 //
-// Calibration recommandée InsightFace buffalo_l :
-//   même personne   : cosinus brut > 0.28  (score > 0.64)
-//   personne diffs  : cosinus brut < 0.15  (score < 0.575)
+// Les seuils InsightFace "selfie vs selfie" (MATCH=0.64) sont trop stricts
+// pour document imprimé vs selfie car :
+//   - portrait carte = N&B ou sépia, basse résolution, parfois flou
+//   - selfie = couleur, haute résolution, éclairage différent
+//   - la distance de domaine abaisse mécaniquement le cosinus de ~0.08–0.12
+//
+// Calibration ajustée pour document vs selfie :
+//   MATCH      : 0.60  — seuil minimal "même personne" (au lieu de 0.64)
+//   LOW_RISK   : 0.68  — match fiable sans révision    (au lieu de 0.72)
+//   MEDIUM_RISK: 0.52  — zone grise → révision manuelle (au lieu de 0.60)
+//   REJECT     : <0.52 — visages différents
 
 const THRESHOLDS_ONNX = {
-  MATCH:         0.64,   // cosinus brut 0.28 — seuil minimal "même personne"
-  LOW_RISK:      0.72,   // cosinus brut 0.44 — match fiable
-  MEDIUM_RISK:   0.60,   // cosinus brut 0.20 — zone grise → révision manuelle
+  MATCH:       0.60,   // cosinus brut ≈ 0.20 — même personne doc vs selfie
+  LOW_RISK:    0.68,   // cosinus brut ≈ 0.36 — match fiable
+  MEDIUM_RISK: 0.52,   // cosinus brut ≈ 0.04 — zone grise
 } as const;
 
 const THRESHOLDS_CLAUDE = {
-  MATCH:         0.82,
-  LOW_RISK:      0.87,
-  MEDIUM_RISK:   0.60,
+  MATCH:       0.82,
+  LOW_RISK:    0.87,
+  MEDIUM_RISK: 0.60,
 } as const;
 
 // ─── Similarité cosinus ───────────────────────────────────────────────────────
@@ -41,7 +47,6 @@ export function cosineSimilarity(a: FaceEmbedding, b: FaceEmbedding): number {
   if (a.length !== b.length) return 0;
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  // Clamp pour éviter les dépassements float
   return (Math.max(-1, Math.min(1, dot)) + 1) / 2;
 }
 
@@ -82,7 +87,7 @@ export function matchFaces(
     ` | seuils: MATCH=${T.MATCH} LOW=${T.LOW_RISK} MED=${T.MEDIUM_RISK}`
   );
 
-  // ── Même personne — match fiable ──────────────────────────────────────────
+  // ── Même personne — match fiable ─────────────────────────────────────────
   if (similarity >= T.LOW_RISK) {
     return {
       matched: true, similarityScore: similarity, riskLevel: 'low',
@@ -90,7 +95,7 @@ export function matchFaces(
     };
   }
 
-  // ── Probablement la même personne mais qualité d'image faible ─────────────
+  // ── Probablement la même personne (qualité doc faible) ───────────────────
   if (similarity >= T.MATCH) {
     return {
       matched: true, similarityScore: similarity, riskLevel: 'medium',
@@ -99,7 +104,7 @@ export function matchFaces(
     };
   }
 
-  // ── Zone grise — révision manuelle ────────────────────────────────────────
+  // ── Zone grise — révision manuelle ───────────────────────────────────────
   if (similarity >= T.MEDIUM_RISK) {
     return {
       matched: false, similarityScore: similarity, riskLevel: 'medium',
